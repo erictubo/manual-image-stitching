@@ -4,6 +4,30 @@ import os
 import glob
 from pathlib import Path
 
+def find_repo_root():
+    """Find the repository root directory by looking for the images folder"""
+    current_dir = Path(__file__).parent
+    repo_root = current_dir
+    
+    # Walk up the directory tree looking for the images folder
+    while repo_root.parent != repo_root:  # Stop at filesystem root
+        if (repo_root / "images").exists():
+            return repo_root
+        repo_root = repo_root.parent
+    
+    # If not found, return current directory
+    return current_dir
+
+def get_default_image_dir(dataset="boat"):
+    """Get the default image directory path for a specific dataset"""
+    repo_root = find_repo_root()
+    return str(repo_root / "images" / dataset)
+
+def get_output_dir(dataset="boat", output_type="output"):
+    """Get the output directory path relative to the script location"""
+    script_dir = Path(__file__).parent
+    return str(script_dir / output_type / dataset)
+
 class StitchingConfig:
     """Configuration class for stitching parameters"""
     def __init__(self):
@@ -17,18 +41,19 @@ class StitchingConfig:
 class ManualImageStitcher:
     """Manual image stitching implementation with step-by-step control"""
     
-    def __init__(self, config=None, visualize=False):
+    def __init__(self, config=None, visualize=False, test_output_dir="test_output"):
         """
         Initialize the manual stitcher
         
         Args:
             config: StitchingConfig object with parameters
             visualize: if True, shows intermediate steps
+            test_output_dir: directory for saving visualization steps
         """
         self.config = config or StitchingConfig()
         self.visualize = visualize
         self.step_counter = 0  # Track visualization steps
-        self.test_output_dir = "stitch_manual/test_output"
+        self.test_output_dir = test_output_dir
         
         # Create test output directory once if visualization is enabled
         if self.visualize:
@@ -591,6 +616,166 @@ class ManualImageStitcher:
         
         return panorama
     
+    def stitch_with_reference(self, images, reference_index=None):
+        """
+        Stitch multiple images using a reference image as the center
+        
+        Args:
+            images: list of numpy arrays
+            reference_index: index of reference image (defaults to middle image)
+            
+        Returns:
+            numpy array: panorama image
+        """
+        if len(images) < 2:
+            raise ValueError("Need at least 2 images for stitching")
+        
+        # Determine reference image index
+        if reference_index is None:
+            reference_index = len(images) // 2  # Default to middle image
+        elif reference_index < 0 or reference_index >= len(images):
+            raise ValueError(f"Invalid reference index: {reference_index}")
+        
+        print(f"Using image {reference_index} as reference (index {reference_index})")
+        
+        # Start with reference image
+        panorama = images[reference_index].copy()
+        
+        # Stitch images to the left of reference (in reverse order)
+        for i in range(reference_index - 1, -1, -1):
+            print(f"Stitching image {i} to reference...")
+            panorama = self.stitch_to_reference(images[i], panorama, is_left=True)
+            if panorama is None:
+                print(f"Failed to stitch image {i} to reference")
+                return None
+        
+        # Stitch images to the right of reference
+        for i in range(reference_index + 1, len(images)):
+            print(f"Stitching image {i} to reference...")
+            panorama = self.stitch_to_reference(images[i], panorama, is_left=False)
+            if panorama is None:
+                print(f"Failed to stitch image {i} to reference")
+                return None
+        
+        return panorama
+    
+    def stitch_to_reference(self, image, reference_panorama, is_left=True):
+        """
+        Stitch a single image to the reference panorama
+        
+        Args:
+            image: image to stitch
+            reference_panorama: current reference panorama
+            is_left: True if image should be stitched to the left of reference
+            
+        Returns:
+            numpy array: updated panorama
+        """
+        if self.visualize:
+            print(f"=== Stitching {'left' if is_left else 'right'} image to reference ===")
+        
+        # Store images for visualization
+        if self.visualize:
+            self._last_images = (reference_panorama, image)
+        
+        # Step 1: Detect features
+        if self.visualize:
+            print("Step 1: Detecting features...")
+        
+        keypoints_ref, descriptors_ref = self.detect_features(reference_panorama)
+        keypoints_img, descriptors_img = self.detect_features(image)
+        
+        # Step 2: Match features
+        if self.visualize:
+            print("Step 2: Matching features...")
+        
+        matches = self.match_features(descriptors_ref, descriptors_img, 
+                                   reference_panorama, image, keypoints_ref, keypoints_img)
+        good_matches = self.filter_matches(matches)
+        
+        # Step 3: Estimate homography
+        if self.visualize:
+            print("Step 3: Estimating homography...")
+        
+        # For left stitching, we want to warp the image to align with reference
+        # For right stitching, we want to warp the image to align with reference
+        # The homography direction is the same in both cases
+        homography, mask = self.estimate_homography(keypoints_ref, keypoints_img, good_matches)
+        
+        if homography is None:
+            print("Failed to estimate homography")
+            return None
+        
+        # Validate the homography
+        is_valid, confidence = self.validate_stitching(reference_panorama, image, homography)
+        if not is_valid:
+            print(f"Homography validation failed (confidence: {confidence:.2f})")
+            return None
+        else:
+            print(f"Homography validation passed (confidence: {confidence:.2f})")
+        
+        # Step 4: Calculate bounds and warp
+        if self.visualize:
+            print("Step 4: Warping image...")
+        
+        output_width, output_height, offset_x, offset_y = self.calculate_stitching_bounds(
+            reference_panorama, image, homography)
+        
+        print(f"Panorama bounds: {output_width}x{output_height}, offset: ({offset_x}, {offset_y})")
+        
+        warped = self.warp_image(image, homography, (output_width, output_height), offset_x, offset_y)
+        
+        # Step 5: Create panorama
+        if self.visualize:
+            print("Step 5: Creating panorama...")
+        
+        panorama = self.create_panorama(reference_panorama, warped, offset_x, offset_y)
+        
+        # Step 6: Post-process
+        if self.visualize:
+            print("Step 6: Post-processing...")
+        
+        final_panorama = self.post_process(panorama)
+        
+        # Visualize final result if enabled
+        if self.visualize:
+            self.step_counter += 1
+            
+            # Save visualization
+            cv2.imwrite(f"{self.test_output_dir}/step_{self.step_counter:02d}_final_panorama.jpg", final_panorama)
+            
+            cv2.imshow("Final Panorama", final_panorama)
+            cv2.waitKey(1000)  # Wait 1 second for final result
+            cv2.destroyAllWindows()
+        
+        return final_panorama
+    
+    def stitch_multiple_adaptive(self, images, reference_index=None):
+        """
+        Adaptive stitching that tries reference-based approach first, falls back to sequential
+        
+        Args:
+            images: list of numpy arrays
+            reference_index: index of reference image (defaults to middle image)
+            
+        Returns:
+            numpy array: panorama image
+        """
+        if len(images) < 2:
+            raise ValueError("Need at least 2 images for stitching")
+        
+        print("Attempting reference-based stitching...")
+        try:
+            result = self.stitch_with_reference(images, reference_index)
+            if result is not None:
+                print("Reference-based stitching successful!")
+                return result
+        except Exception as e:
+            print(f"Reference-based stitching failed: {e}")
+        
+        print("Falling back to sequential stitching...")
+        return self.stitch_multiple(images)
+    
     def crop_black_borders(self, panorama):
         """
         Crop black borders from the panorama
@@ -800,12 +985,14 @@ class ManualImageStitcher:
         
         return True, confidence
     
-    def stitch_panorama(self, images):
+    def stitch_panorama(self, images, method="adaptive", reference_index=None):
         """
-        Complete end-to-end stitching pipeline
+        Complete end-to-end stitching pipeline with multiple strategies
         
         Args:
             images: list of numpy arrays
+            method: stitching method ("sequential", "reference", "adaptive")
+            reference_index: index of reference image (for reference method)
             
         Returns:
             numpy array: final panorama
@@ -813,8 +1000,18 @@ class ManualImageStitcher:
         if len(images) < 2:
             raise ValueError("Need at least 2 images for stitching")
         
-        # Step 1: Stitch multiple images
-        panorama = self.stitch_multiple(images)
+        # Step 1: Stitch multiple images using specified method
+        if method == "sequential":
+            print("Using sequential stitching method...")
+            panorama = self.stitch_multiple(images)
+        elif method == "reference":
+            print("Using reference-based stitching method...")
+            panorama = self.stitch_with_reference(images, reference_index)
+        elif method == "adaptive":
+            print("Using adaptive stitching method...")
+            panorama = self.stitch_multiple_adaptive(images, reference_index)
+        else:
+            raise ValueError(f"Unknown stitching method: {method}")
         
         if panorama is None:
             return None
@@ -823,17 +1020,72 @@ class ManualImageStitcher:
         processed_panorama = self.post_process(panorama)
         
         return processed_panorama
+    
+    def stitch_panorama_reference(self, images, reference_index=None):
+        """
+        Reference-based stitching pipeline (convenience method)
+        
+        Args:
+            images: list of numpy arrays
+            reference_index: index of reference image (defaults to middle image)
+            
+        Returns:
+            numpy array: final panorama
+        """
+        return self.stitch_panorama(images, method="reference", reference_index=reference_index)
+    
+    def stitch_panorama_sequential(self, images):
+        """
+        Sequential stitching pipeline (convenience method)
+        
+        Args:
+            images: list of numpy arrays
+            
+        Returns:
+            numpy array: final panorama
+        """
+        return self.stitch_panorama(images, method="sequential")
 
 def main():
     """Main function to demonstrate usage"""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Manual Image Stitcher')
+    parser.add_argument('--dataset', type=str, default='boat',
+                       help='Dataset name (default: boat)')
+    parser.add_argument('--output_name', type=str, default='manual_panorama.jpg',
+                       help='Name of output panorama file')
+    parser.add_argument('--method', type=str, default='adaptive',
+                       choices=['sequential', 'reference', 'adaptive'],
+                       help='Stitching method to use')
+    parser.add_argument('--reference_index', type=int, default=None,
+                       help='Index of reference image (for reference method)')
+    parser.add_argument('--no-visualize', action='store_true',
+                       help='Disable step-by-step visualization (enabled by default)')
+    
+    args = parser.parse_args()
+    
+    # Handle visualization flags
+    visualize = not args.no_visualize
+    
+    # Get paths based on dataset
+    input_dir = get_default_image_dir(args.dataset)
+    output_dir = get_output_dir(args.dataset, "output")
+    steps_dir = get_output_dir(args.dataset, "steps")
+    
     # Initialize stitcher
     config = StitchingConfig()
-    stitcher = ManualImageStitcher(config)
+    stitcher = ManualImageStitcher(config, visualize=visualize, test_output_dir=steps_dir)
     
     # Load images
-    image_dir = "../images"
-    image_files = glob.glob(os.path.join(image_dir, "*.JPG"))
+    image_files = glob.glob(os.path.join(input_dir, "*.jpg"))
+    image_files.extend(glob.glob(os.path.join(input_dir, "*.JPG")))
     image_files.sort()
+    
+    if not image_files:
+        print(f"No image files found in {input_dir}")
+        return
     
     images = []
     for file_path in image_files:
@@ -842,24 +1094,26 @@ def main():
             images.append(img)
             print(f"Loaded: {os.path.basename(file_path)} - Shape: {img.shape}")
     
-    if len(images) >= 2:
-        # Stitch panorama
-        panorama = stitcher.stitch_panorama(images)
-        
-        if panorama is not None:
-            # Save result
-            os.makedirs("output", exist_ok=True)
-            cv2.imwrite("output/manual_panorama.jpg", panorama)
-            print("Manual panorama saved as output/manual_panorama.jpg")
-            
-            # Display result
-            cv2.imshow("Manual Panorama", panorama)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-        else:
-            print("Manual stitching failed")
-    else:
+    if len(images) < 2:
         print("Need at least 2 images for stitching")
+        return
+    
+    # Stitch panorama
+    panorama = stitcher.stitch_panorama(images, method=args.method, reference_index=args.reference_index)
+    
+    if panorama is not None:
+        # Save result
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, args.output_name)
+        cv2.imwrite(output_path, panorama)
+        print(f"Manual panorama saved as {output_path}")
+        
+        # Display result
+        cv2.imshow("Manual Panorama", panorama)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    else:
+        print("Manual stitching failed")
 
 if __name__ == "__main__":
     main() 

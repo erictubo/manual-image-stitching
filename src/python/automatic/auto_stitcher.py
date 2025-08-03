@@ -4,6 +4,35 @@ import os
 import glob
 from pathlib import Path
 
+def find_repo_root():
+    """Find the repository root directory by looking for the images folder"""
+    current_dir = Path(__file__).parent
+    repo_root = current_dir
+    
+    # Walk up the directory tree looking for the images folder
+    while repo_root.parent != repo_root:  # Stop at filesystem root
+        if (repo_root / "images").exists():
+            return repo_root
+        repo_root = repo_root.parent
+    
+    # If not found, return current directory
+    return current_dir
+
+def get_default_image_dir():
+    """Get the default image directory path"""
+    repo_root = find_repo_root()
+    return str(repo_root / "images" / "boat")
+
+def get_output_dir(output_dir, repo_root=None):
+    """Get the output directory path, making it relative to repo root if it's a relative path"""
+    if repo_root is None:
+        repo_root = find_repo_root()
+    
+    # If output_dir is a relative path, make it relative to repo root
+    if not os.path.isabs(output_dir):
+        return str(repo_root / output_dir)
+    return output_dir
+
 class ImageStitcher:
     def __init__(self):
         # Initialize the OpenCV stitcher
@@ -100,21 +129,38 @@ class ImageStitcher:
             print("No panorama to display")
 
 def main():
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Automatic Image Stitcher')
+    parser.add_argument('--input_dir', type=str, default=get_default_image_dir(),
+                       help='Directory containing input images')
+    parser.add_argument('--output_dir', type=str, default='output',
+                       help='Directory to save output panorama')
+    parser.add_argument('--output_name', type=str, default='panorama.jpg',
+                       help='Name of output panorama file')
+    parser.add_argument('--max_width', type=int, default=3000,
+                       help='Maximum width for image resizing')
+    parser.add_argument('--max_height', type=int, default=3000,
+                       help='Maximum height for image resizing')
+    parser.add_argument('--display', action='store_true',
+                       help='Display the panorama after stitching')
+    
+    args = parser.parse_args()
+    
     # Initialize the stitcher
     stitcher = ImageStitcher()
     
     # Set paths
-    image_dir = "../images"
-    output_dir = "output"
-    output_path = os.path.join(output_dir, "panorama.jpg")
+    output_path = os.path.join(get_output_dir(args.output_dir), args.output_name)
     
     # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(get_output_dir(args.output_dir), exist_ok=True)
     
     try:
         # Load images
         print("Loading images...")
-        images = stitcher.load_images(image_dir)
+        images = stitcher.load_images(args.input_dir, args.max_width, args.max_height)
         
         if len(images) < 2:
             print("Error: Need at least 2 images for stitching")
@@ -128,9 +174,10 @@ def main():
             # Save the panorama
             stitcher.save_panorama(panorama, output_path)
             
-            # Display the panorama
-            print("Press any key to close the display window...")
-            stitcher.display_panorama(panorama)
+            # Display the panorama if requested
+            if args.display:
+                print("Press any key to close the display window...")
+                stitcher.display_panorama(panorama)
             
         else:
             print("Failed to create panorama")
