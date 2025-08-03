@@ -18,20 +18,15 @@ def find_repo_root():
     # If not found, return current directory
     return current_dir
 
-def get_default_image_dir():
-    """Get the default image directory path"""
+def get_default_image_dir(dataset):
+    """Get the default image directory path for a specific dataset"""
     repo_root = find_repo_root()
-    return str(repo_root / "images" / "boat")
+    return str(repo_root / "images" / dataset)
 
-def get_output_dir(output_dir, repo_root=None):
-    """Get the output directory path, making it relative to repo root if it's a relative path"""
-    if repo_root is None:
-        repo_root = find_repo_root()
-    
-    # If output_dir is a relative path, make it relative to repo root
-    if not os.path.isabs(output_dir):
-        return str(repo_root / output_dir)
-    return output_dir
+def get_output_dir(dataset):
+    """Get the output directory path for a specific dataset"""
+    script_dir = Path(__file__).parent
+    return str(script_dir / "output" / dataset)
 
 class ImageStitcher:
     def __init__(self):
@@ -133,10 +128,10 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Automatic Image Stitcher')
-    parser.add_argument('--input_dir', type=str, default=get_default_image_dir(),
-                       help='Directory containing input images')
-    parser.add_argument('--output_dir', type=str, default='output',
-                       help='Directory to save output panorama')
+    parser.add_argument('--dataset', type=str, required=True,
+                       help='Dataset name (e.g., boat3, boat6)')
+    parser.add_argument('--input_dir', type=str, default=None,
+                       help='Directory containing input images (defaults to images/<dataset>)')
     parser.add_argument('--output_name', type=str, default='panorama.jpg',
                        help='Name of output panorama file')
     parser.add_argument('--max_width', type=int, default=3000,
@@ -152,15 +147,21 @@ def main():
     stitcher = ImageStitcher()
     
     # Set paths
-    output_path = os.path.join(get_output_dir(args.output_dir), args.output_name)
+    if args.input_dir is None:
+        input_dir = get_default_image_dir(args.dataset)
+    else:
+        input_dir = args.input_dir
+    
+    output_dir = get_output_dir(args.dataset)
+    output_path = os.path.join(output_dir, args.output_name)
     
     # Create output directory if it doesn't exist
-    os.makedirs(get_output_dir(args.output_dir), exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     try:
         # Load images
-        print("Loading images...")
-        images = stitcher.load_images(args.input_dir, args.max_width, args.max_height)
+        print(f"Loading images from: {input_dir}")
+        images = stitcher.load_images(input_dir, args.max_width, args.max_height)
         
         if len(images) < 2:
             print("Error: Need at least 2 images for stitching")
@@ -186,4 +187,4 @@ def main():
         print(f"Error: {e}")
 
 if __name__ == "__main__":
-    main() 
+    main()

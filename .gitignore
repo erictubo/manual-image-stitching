@@ -1,2 +1,5 @@
 .DS_Store
 *.cpython*
+__pycache__/
+*.pyc
+build/

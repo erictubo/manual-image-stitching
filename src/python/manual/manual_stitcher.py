@@ -18,12 +18,12 @@ def find_repo_root():
     # If not found, return current directory
     return current_dir
 
-def get_default_image_dir(dataset="boat"):
+def get_default_image_dir(dataset):
     """Get the default image directory path for a specific dataset"""
     repo_root = find_repo_root()
     return str(repo_root / "images" / dataset)
 
-def get_output_dir(dataset="boat", output_type="output"):
+def get_output_dir(dataset, output_type="output"):
     """Get the output directory path relative to the script location"""
     script_dir = Path(__file__).parent
     return str(script_dir / output_type / dataset)
@@ -37,13 +37,15 @@ class StitchingConfig:
         self.ransac_threshold = 5.0
         self.blend_width = 50
         self.min_matches = 10
+        self.projection_type = 'perspective'  # 'perspective' or 'spherical'
+        self.focal_length = 25.0  # Real focal length in mm
 
-class ManualImageStitcher:
-    """Manual image stitching implementation with step-by-step control"""
+class ImageStitcher:
+    """Image stitching with intelligent reference-based approach"""
     
     def __init__(self, config=None, visualize=False, test_output_dir="test_output"):
         """
-        Initialize the manual stitcher
+        Initialize the stitcher
         
         Args:
             config: StitchingConfig object with parameters
@@ -81,20 +83,12 @@ class ManualImageStitcher:
         self.ransac_threshold = self.config.ransac_threshold
         self.blend_width = self.config.blend_width
         self.min_matches = self.config.min_matches
-    
+        self.projection_type = self.config.projection_type
+        self.focal_length = self.config.focal_length
+        # Remove arbitrary sphere dimensions - they'll be calculated automatically
 
     def detect_features(self, image):
-        """
-        Detect keypoints and extract descriptors from a single image
-        
-        Args:
-            image: numpy array of the input image
-            
-        Returns:
-            tuple: (keypoints, descriptors)
-                - keypoints: list of cv2.KeyPoint objects
-                - descriptors: numpy array of feature descriptors
-        """
+        """Detect keypoints and extract descriptors from a single image"""
         if image is None:
             print("Error: Input image is None")
             return [], None
@@ -130,22 +124,8 @@ class ManualImageStitcher:
         
         return keypoints, descriptors
 
-    
     def match_features(self, descriptors1, descriptors2, image1=None, image2=None, keypoints1=None, keypoints2=None):
-        """
-        Match features between two sets of descriptors
-        
-        Args:
-            descriptors1: numpy array of descriptors from first image
-            descriptors2: numpy array of descriptors from second image
-            image1: first image (for visualization)
-            image2: second image (for visualization)
-            keypoints1: keypoints from first image (for visualization)
-            keypoints2: keypoints from second image (for visualization)
-            
-        Returns:
-            list: list of cv2.DMatch objects (all matches, not filtered)
-        """
+        """Match features between two sets of descriptors"""
         # Check if descriptors are valid
         if descriptors1 is None or descriptors2 is None:
             print("Error: Invalid descriptors provided")
@@ -175,17 +155,9 @@ class ManualImageStitcher:
         except Exception as e:
             print(f"Error during feature matching: {e}")
             return []
-    
+
     def filter_matches(self, matches):
-        """
-        Filter matches using Lowe's ratio test
-        
-        Args:
-            matches: list of cv2.DMatch objects (from knnMatch with k=2)
-            
-        Returns:
-            list: filtered matches
-        """
+        """Filter matches using Lowe's ratio test"""
         if not matches:
             print("No matches to filter")
             return []
@@ -213,29 +185,14 @@ class ManualImageStitcher:
             cv2.destroyAllWindows()
         
         return good_matches
-    
+
     def estimate_homography(self, keypoints1, keypoints2, matches):
-        """
-        Estimate homography matrix between two sets of keypoints
-        
-        Args:
-            keypoints1: list of cv2.KeyPoint objects from first image
-            keypoints2: list of cv2.KeyPoint objects from second image
-            matches: list of cv2.DMatch objects
-            
-        Returns:
-            tuple: (homography_matrix, mask) or (None, None) if failed
-                - homography_matrix: 3x3 numpy array
-                - mask: boolean array indicating inliers
-        """
+        """Estimate homography matrix between two sets of keypoints"""
         if len(matches) < self.min_matches:
             print(f"Not enough matches: {len(matches)} < {self.min_matches}")
             return None, None
         
         # Extract matched keypoints
-        # We want to warp image2 to align with image1, so:
-        # src_pts = points in image2 (to be warped)
-        # dst_pts = corresponding points in image1 (reference)
         src_pts = np.float32([keypoints2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
         dst_pts = np.float32([keypoints1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
         
@@ -255,52 +212,46 @@ class ManualImageStitcher:
             if inlier_ratio < 0.5:
                 print("Warning: Low inlier ratio, homography may be unreliable")
         
-        # Additional validation: check if homography is reasonable
-        try:
-            # Check determinant (should be positive for valid transformation)
-            det = np.linalg.det(H)
-            if det <= 0:
-                print("Warning: Homography determinant is non-positive")
-                return None, None
-            
-            # Check if transformation is not too extreme
-            if abs(det) > 1000 or abs(det) < 0.001:
-                print("Warning: Homography determinant is extreme, transformation may be unreliable")
-                return None, None
-                
-        except np.linalg.LinAlgError:
-            print("Error: Homography matrix is singular")
-            return None, None
-        
-        # Visualize if enabled
-        if self.visualize and hasattr(self, '_last_images'):
-            self.step_counter += 1
-            image1, image2 = self._last_images
-            img_homography = self.visualize_homography(image1, image2, H)
-            
-            # Save visualization
-            cv2.imwrite(f"{self.test_output_dir}/step_{self.step_counter:02d}_homography.jpg", img_homography)
-            
-            cv2.imshow("Homography Transformation", img_homography)
-            cv2.waitKey(500)  # Wait 0.5 seconds for better flow
-            cv2.destroyAllWindows()
-            
         return H, mask
-    
-    def warp_image(self, image, homography, output_size, offset_x=0, offset_y=0):
-        """
-        Warp an image using homography matrix with optional offset
+
+    def calculate_stitching_bounds(self, image1, image2, homography):
+        """Calculate the bounds for the stitched panorama"""
+        # Get image dimensions
+        h1, w1 = image1.shape[:2]
+        h2, w2 = image2.shape[:2]
         
-        Args:
-            image: numpy array of input image
-            homography: 3x3 homography matrix
-            output_size: tuple (width, height) of output image
-            offset_x: x offset for translation
-            offset_y: y offset for translation
-            
-        Returns:
-            numpy array: warped image
-        """
+        # Transform corners of image2 using homography
+        corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
+        warped_corners2 = cv2.perspectiveTransform(corners2, homography)
+        
+        # Get corners of image1 (reference)
+        corners1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
+        
+        # Combine all corners to find bounding box
+        all_corners = np.vstack([corners1, warped_corners2.reshape(-1, 2)])
+        
+        # Calculate bounds
+        min_x = int(np.floor(all_corners[:, 0].min()))
+        max_x = int(np.ceil(all_corners[:, 0].max()))
+        min_y = int(np.floor(all_corners[:, 1].min()))
+        max_y = int(np.ceil(all_corners[:, 1].max()))
+        
+        # Calculate output dimensions and offset
+        output_width = max_x - min_x
+        output_height = max_y - min_y
+        offset_x = -min_x  # How much to shift image1
+        offset_y = -min_y  # How much to shift image1
+        
+        # Ensure minimum size
+        if output_width < max(w1, w2):
+            output_width = max(w1, w2)
+        if output_height < max(h1, h2):
+            output_height = max(h1, h2)
+        
+        return output_width, output_height, offset_x, offset_y
+
+    def warp_image(self, image, homography, output_size, offset_x=0, offset_y=0):
+        """Warp an image using homography matrix with optional offset"""
         if image is None or homography is None:
             print("Error: Invalid input for warping")
             return None
@@ -343,80 +294,9 @@ class ManualImageStitcher:
         except Exception as e:
             print(f"Error during image warping: {e}")
             return None
-    
-    def calculate_stitching_bounds(self, image1, image2, homography):
-        """
-        Calculate the bounds for the stitched panorama
-        
-        Args:
-            image1: first image (reference image)
-            image2: second image (image to be warped)
-            homography: homography matrix from image2 to image1
-            
-        Returns:
-            tuple: (output_width, output_height, offset_x, offset_y)
-        """
-        # Get image dimensions
-        h1, w1 = image1.shape[:2]
-        h2, w2 = image2.shape[:2]
-        
-        # Transform corners of image2 using homography
-        corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
-        warped_corners2 = cv2.perspectiveTransform(corners2, homography)
-        
-        # Get corners of image1 (reference)
-        corners1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
-        
-        # Combine all corners to find bounding box
-        all_corners = np.vstack([corners1, warped_corners2.reshape(-1, 2)])
-        
-        # Calculate bounds
-        min_x = int(np.floor(all_corners[:, 0].min()))
-        max_x = int(np.ceil(all_corners[:, 0].max()))
-        min_y = int(np.floor(all_corners[:, 1].min()))
-        max_y = int(np.ceil(all_corners[:, 1].max()))
-        
-        # Calculate output dimensions and offset
-        output_width = max_x - min_x
-        output_height = max_y - min_y
-        offset_x = -min_x  # How much to shift image1
-        offset_y = -min_y  # How much to shift image1
-        
-        # Ensure minimum size
-        if output_width < max(w1, w2):
-            output_width = max(w1, w2)
-        if output_height < max(h1, h2):
-            output_height = max(h1, h2)
-        
-        # Debug: Print more detailed information
-        print(f"Bounds calculation:")
-        print(f"  Image1 corners: {corners1}")
-        print(f"  Warped image2 corners: {warped_corners2.reshape(-1, 2)}")
-        print(f"  Min/Max X: {min_x}/{max_x}, Min/Max Y: {min_y}/{max_y}")
-        print(f"  Output size: {output_width}x{output_height}")
-        print(f"  Offset: ({offset_x}, {offset_y})")
-        
-        # Additional validation: check if the warped image corners make sense
-        warped_corners_flat = warped_corners2.reshape(-1, 2)
-        print(f"  Warped image2 Y coordinates: {warped_corners_flat[:, 1]}")
-        print(f"  Image1 Y coordinates: {corners1[:, 1]}")
-        
-        return output_width, output_height, offset_x, offset_y
-        
-    
+
     def create_panorama(self, image1, warped_image, offset_x, offset_y):
-        """
-        Create panorama by combining image1 and warped image with smooth transition
-        
-        Args:
-            image1: first image (reference image)
-            warped_image: second image after warping (already positioned correctly)
-            offset_x: x offset for placing image1
-            offset_y: y offset for placing image1
-            
-        Returns:
-            numpy array: combined panorama
-        """
+        """Create panorama by combining image1 and warped image with smooth transition"""
         # Get dimensions
         h1, w1 = image1.shape[:2]
         warped_h, warped_w = warped_image.shape[:2]
@@ -472,16 +352,20 @@ class ManualImageStitcher:
                         if 0 <= col_idx < alpha_mask.shape[1]:
                             alpha_mask[:, col_idx] = alpha
                 
-                # Vectorized blending
-                # Check if warped image has content (not black)
-                warped_has_content = np.any(panorama_region > 10, axis=2, keepdims=True)
+                # Improved blending logic to prevent dark areas
+                # Check if both images have meaningful content
+                warped_has_content = np.any(panorama_region > 5, axis=2, keepdims=True)  # Lower threshold
+                img1_has_content = np.any(img1_region > 5, axis=2, keepdims=True)  # Check image1 too
                 
-                # Blend where warped image has content
+                # Create blended result
                 blended = (alpha_mask * img1_region + 
                           (1 - alpha_mask) * panorama_region).astype(np.uint8)
                 
-                # Use blended result where warped has content, otherwise use image1
-                panorama_region = np.where(warped_has_content, blended, img1_region)
+                # Use blended result where both images have content
+                # Otherwise, use the image that has content
+                both_have_content = warped_has_content & img1_has_content
+                panorama_region = np.where(both_have_content, blended, 
+                                         np.where(warped_has_content, panorama_region, img1_region))
             else:
                 # No overlap in valid region, just use image1
                 panorama_region = img1_region
@@ -505,120 +389,143 @@ class ManualImageStitcher:
         
         return panorama
 
-    def stitch_pair(self, image1, image2):
+    def project_to_sphere(self, image):
         """
-        Complete pipeline for stitching two images
+        Project an image to spherical coordinates using calculated dimensions
         
         Args:
-            image1: first image
-            image2: second image
+            image: input image (600x400 pixels)
             
         Returns:
-            numpy array: stitched image
+            numpy array: spherical projection of the image
         """
-        if self.visualize:
-            print("=== Step-by-step visualization ===")
+        h, w = image.shape[:2]  # Should be 400x600
         
-        # Store images for visualization
-        if self.visualize:
-            self._last_images = (image1, image2)
+        # Calculate sphere dimensions based on camera parameters
+        sphere_width, sphere_height = self.calculate_sphere_dimensions(image)
         
-        # Step 1: Detect features
-        if self.visualize:
-            print("Step 1: Detecting features...")
+        # Create output spherical image
+        sphere_img = np.zeros((sphere_height, sphere_width, image.shape[2]), dtype=image.dtype)
         
-        keypoints1, descriptors1 = self.detect_features(image1)
-        keypoints2, descriptors2 = self.detect_features(image2)
+        # Create coordinate grids for spherical output
+        y_sphere, x_sphere = np.meshgrid(np.arange(sphere_height), np.arange(sphere_width), indexing='ij')
         
-        # Step 2: Match features
-        if self.visualize:
-            print("Step 2: Matching features...")
+        # Convert to normalized coordinates [-1, 1]
+        x_norm = (x_sphere - sphere_width/2) / (sphere_width/2)
+        y_norm = (y_sphere - sphere_height/2) / (sphere_height/2)
         
-        matches = self.match_features(descriptors1, descriptors2, image1, image2, keypoints1, keypoints2)
-        good_matches = self.filter_matches(matches)
+        # Convert to spherical coordinates
+        # For a 25mm lens, we need to calculate the proper angular coverage
+        # Assuming a typical sensor size, we can estimate the field of view
         
-        # Step 3: Estimate homography
-        if self.visualize:
-            print("Step 3: Estimating homography...")
+        # Calculate field of view based on focal length and sensor size
+        # For a typical APS-C sensor (23.5mm width), 25mm focal length gives ~53° FOV
+        fov_horizontal = 53.0  # degrees
+        fov_vertical = 35.0    # degrees (approximate)
         
-        homography, mask = self.estimate_homography(keypoints1, keypoints2, good_matches)
+        # Convert FOV to radians
+        fov_h_rad = np.radians(fov_horizontal)
+        fov_v_rad = np.radians(fov_vertical)
         
-        if homography is None:
-            print("Failed to estimate homography")
-            return None
+        # Map normalized coordinates to angular coordinates
+        theta = x_norm * fov_h_rad  # Horizontal angle
+        phi = y_norm * fov_v_rad    # Vertical angle
         
-        # Validate the homography
-        is_valid, confidence = self.validate_stitching(image1, image2, homography)
-        if not is_valid:
-            print(f"Homography validation failed (confidence: {confidence:.2f})")
-            return None
-        else:
-            print(f"Homography validation passed (confidence: {confidence:.2f})")
+        # Convert spherical coordinates to image coordinates
+        # Using proper perspective projection
+        x_img = self.focal_length * np.tan(theta)
+        y_img = self.focal_length * np.tan(phi) / np.cos(theta)
         
-        # Step 4: Calculate bounds and warp
-        if self.visualize:
-            print("Step 4: Warping image...")
+        # Convert to pixel coordinates
+        # Scale to match image dimensions
+        x_pixel = x_img * (w / (2 * self.focal_length * np.tan(fov_h_rad/2))) + w/2
+        y_pixel = y_img * (h / (2 * self.focal_length * np.tan(fov_v_rad/2))) + h/2
         
-        output_width, output_height, offset_x, offset_y = self.calculate_stitching_bounds(
-            image1, image2, homography)
+        # Use remap for efficient interpolation
+        x_pixel = x_pixel.astype(np.float32)
+        y_pixel = y_pixel.astype(np.float32)
         
-        print(f"Panorama bounds: {output_width}x{output_height}, offset: ({offset_x}, {offset_y})")
+        # Remap the image
+        sphere_img = cv2.remap(image, x_pixel, y_pixel, cv2.INTER_LINEAR, 
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         
-        warped = self.warp_image(image2, homography, (output_width, output_height), offset_x, offset_y)
-        
-        # Step 5: Create panorama
-        if self.visualize:
-            print("Step 5: Creating panorama...")
-        
-        panorama = self.create_panorama(image1, warped, offset_x, offset_y)
-        
-        # Step 6: Post-process
-        if self.visualize:
-            print("Step 6: Post-processing...")
-        
-        final_panorama = self.post_process(panorama)
-        
-        # Visualize final result if enabled
-        if self.visualize:
-            self.step_counter += 1
-            
-            # Save visualization
-            cv2.imwrite(f"{self.test_output_dir}/step_{self.step_counter:02d}_final_panorama.jpg", final_panorama)
-            
-            cv2.imshow("Final Panorama", final_panorama)
-            cv2.waitKey(1000)  # Wait 1 second for final result
-            cv2.destroyAllWindows()
-        
-        return final_panorama
+        return sphere_img
 
-    def stitch_multiple(self, images):
+    def calculate_sphere_dimensions(self, image):
         """
-        Stitch multiple images sequentially
+        Calculate optimal sphere dimensions based on camera parameters
         
         Args:
-            images: list of numpy arrays
+            image: input image
             
         Returns:
-            numpy array: panorama image
+            tuple: (width, height) for sphere projection
         """
-        if len(images) < 2:
-            raise ValueError("Need at least 2 images for stitching")
+        h, w = image.shape[:2]
         
-        # Start with first image
-        panorama = images[0]
+        # Calculate field of view based on focal length
+        # For 25mm focal length on APS-C sensor (23.5mm width)
+        sensor_width_mm = 23.5  # APS-C sensor width
+        fov_horizontal = 2 * np.arctan(sensor_width_mm / (2 * self.focal_length))
+        fov_vertical = 2 * np.arctan((sensor_width_mm * h / w) / (2 * self.focal_length))
         
-        # Stitch each subsequent image
-        for i in range(1, len(images)):
-            panorama = self.stitch_pair(panorama, images[i])
-            if panorama is None:
-                print(f"Failed to stitch image {i+1}")
-                return None
+        # Convert to degrees
+        fov_h_deg = np.degrees(fov_horizontal)
+        fov_v_deg = np.degrees(fov_vertical)
         
-        return panorama
-    
-    def stitch_with_reference(self, images, reference_index=None):
+        print(f"Calculated FOV: {fov_h_deg:.1f}° x {fov_v_deg:.1f}°")
+        
+        # Calculate sphere dimensions based on angular coverage
+        # For a single image, we use the full FOV
+        # For stitching, we'll adjust based on overlap
+        
+        # Base sphere dimensions on angular coverage with HIGHER RESOLUTION
+        # 360° = full panorama width
+        sphere_width = int((fov_h_deg / 360.0) * w * 8)  # Increased scale factor for higher resolution
+        sphere_height = int(h * 2)  # Double the height for higher resolution
+        
+        # Ensure minimum dimensions
+        sphere_width = max(sphere_width, w * 2)  # At least double the input width
+        sphere_height = max(sphere_height, h * 2)  # At least double the input height
+        
+        print(f"Calculated sphere dimensions: {sphere_width}x{sphere_height}")
+        
+        return sphere_width, sphere_height
+
+    def project_images_to_sphere(self, images):
         """
-        Stitch multiple images using a reference image as the center
+        Project all images to spherical coordinates
+        
+        Args:
+            images: list of input images
+            
+        Returns:
+            list: spherical projections of all images
+        """
+        if self.projection_type != 'spherical':
+            return images  # Return original images for perspective projection
+        
+        print("Projecting images to spherical coordinates...")
+        sphere_images = []
+        
+        for i, image in enumerate(images):
+            print(f"Projecting image {i} to sphere...")
+            sphere_img = self.project_to_sphere(image)
+            sphere_images.append(sphere_img)
+            
+            # Visualize if enabled
+            if self.visualize:
+                self.step_counter += 1
+                cv2.imwrite(f"{self.test_output_dir}/step_{self.step_counter:02d}_sphere_projection_{i}.jpg", sphere_img)
+                cv2.imshow(f"Spherical Projection {i}", sphere_img)
+                cv2.waitKey(500)
+                cv2.destroyAllWindows()
+        
+        return sphere_images
+
+    def stitch_intelligent_reference(self, images, reference_index=None):
+        """
+        Intelligent reference-based stitching that finds the best matches progressively
         
         Args:
             images: list of numpy arrays
@@ -629,6 +536,10 @@ class ManualImageStitcher:
         """
         if len(images) < 2:
             raise ValueError("Need at least 2 images for stitching")
+        
+        # Auto-configure projection parameters if using spherical projection
+        if self.projection_type == 'spherical':
+            self.auto_configure_projection(images)
         
         # Determine reference image index
         if reference_index is None:
@@ -638,154 +549,108 @@ class ManualImageStitcher:
         
         print(f"Using image {reference_index} as reference (index {reference_index})")
         
-        # Start with reference image
-        panorama = images[reference_index].copy()
+        # Step 1: Project all images to spherical coordinates (if using spherical projection)
+        print("Step 1: Projecting images to spherical coordinates...")
+        processed_images = self.project_images_to_sphere(images)
         
-        # Stitch images to the left of reference (in reverse order)
-        for i in range(reference_index - 1, -1, -1):
-            print(f"Stitching image {i} to reference...")
-            panorama = self.stitch_to_reference(images[i], panorama, is_left=True)
-            if panorama is None:
-                print(f"Failed to stitch image {i} to reference")
-                return None
+        # Step 2: Detect features in all SPHERICAL images (after projection)
+        print("Step 2: Detecting features in spherical images...")
+        all_keypoints = []
+        all_descriptors = []
         
-        # Stitch images to the right of reference
-        for i in range(reference_index + 1, len(images)):
-            print(f"Stitching image {i} to reference...")
-            panorama = self.stitch_to_reference(images[i], panorama, is_left=False)
-            if panorama is None:
-                print(f"Failed to stitch image {i} to reference")
-                return None
+        for i, image in enumerate(processed_images):
+            print(f"Detecting features in spherical image {i}...")
+            keypoints, descriptors = self.detect_features(image)
+            all_keypoints.append(keypoints)
+            all_descriptors.append(descriptors)
         
-        return panorama
-    
-    def stitch_to_reference(self, image, reference_panorama, is_left=True):
-        """
-        Stitch a single image to the reference panorama
+        # Store for use in lookup methods
+        self.all_keypoints = all_keypoints
+        self.all_descriptors = all_descriptors
         
-        Args:
-            image: image to stitch
-            reference_panorama: current reference panorama
-            is_left: True if image should be stitched to the left of reference
+        # Step 3: Create correspondence lookup table (EFFICIENT APPROACH)
+        print("Step 3: Creating correspondence lookup table...")
+        lookup = self.create_correspondence_lookup(all_keypoints, all_descriptors, processed_images)
+        
+        # Step 4: Start with reference image
+        print("Step 4: Starting with reference image...")
+        panorama = processed_images[reference_index].copy()
+        used_images = {reference_index}
+        
+        # Step 5: Progressively add images using lookup table (EFFICIENT)
+        while len(used_images) < len(images):
+            print(f"\nStep 5: Finding next best match using lookup table (used: {len(used_images)}/{len(images)})...")
             
-        Returns:
-            numpy array: updated panorama
-        """
-        if self.visualize:
-            print(f"=== Stitching {'left' if is_left else 'right'} image to reference ===")
+            # Find best next image using lookup table
+            best_match_idx, best_match_count, best_homography = self.find_best_next_image(used_images, lookup)
+            
+            if best_match_idx == -1:
+                print("No more images can be stitched!")
+                break
+            
+            print(f"Selected image {best_match_idx} with {best_match_count} total correspondences")
+            
+            # Step 6: Stitch the best matching image
+            print(f"Step 6: Stitching image {best_match_idx} to panorama...")
+            
+            # For the first few images, we can use the lookup homography directly
+            # For later images, we need to re-match against the growing panorama
+            if len(used_images) == 1:
+                # First image after reference - use lookup homography
+                homography = best_homography
+            else:
+                # Multiple images in panorama - re-match against current panorama
+                print(f"Re-matching image {best_match_idx} against current panorama...")
+                panorama_keypoints, panorama_descriptors = self.detect_features(panorama)
+                
+                matches = self.match_features(panorama_descriptors, all_descriptors[best_match_idx], 
+                                           panorama, processed_images[best_match_idx], panorama_keypoints, all_keypoints[best_match_idx])
+                good_matches = self.filter_matches(matches)
+                
+                if len(good_matches) >= self.min_matches:
+                    homography, mask = self.estimate_homography(panorama_keypoints, all_keypoints[best_match_idx], good_matches)
+                    if homography is None:
+                        print(f"Failed to estimate homography for image {best_match_idx}")
+                        break
+                else:
+                    print(f"Insufficient matches for image {best_match_idx}")
+                    break
+            
+            # Calculate bounds and warp
+            output_width, output_height, offset_x, offset_y = self.calculate_stitching_bounds(
+                panorama, processed_images[best_match_idx], homography)
+            
+            warped = self.warp_image(processed_images[best_match_idx], homography, 
+                                   (output_width, output_height), offset_x, offset_y)
+            
+            if warped is not None:
+                # Create new panorama
+                panorama = self.create_panorama(panorama, warped, offset_x, offset_y)
+                used_images.add(best_match_idx)
+                
+                print(f"Successfully stitched image {best_match_idx}. Panorama size: {panorama.shape}")
+            else:
+                print(f"Failed to warp image {best_match_idx}")
+                break
         
-        # Store images for visualization
-        if self.visualize:
-            self._last_images = (reference_panorama, image)
-        
-        # Step 1: Detect features
-        if self.visualize:
-            print("Step 1: Detecting features...")
-        
-        keypoints_ref, descriptors_ref = self.detect_features(reference_panorama)
-        keypoints_img, descriptors_img = self.detect_features(image)
-        
-        # Step 2: Match features
-        if self.visualize:
-            print("Step 2: Matching features...")
-        
-        matches = self.match_features(descriptors_ref, descriptors_img, 
-                                   reference_panorama, image, keypoints_ref, keypoints_img)
-        good_matches = self.filter_matches(matches)
-        
-        # Step 3: Estimate homography
-        if self.visualize:
-            print("Step 3: Estimating homography...")
-        
-        # For left stitching, we want to warp the image to align with reference
-        # For right stitching, we want to warp the image to align with reference
-        # The homography direction is the same in both cases
-        homography, mask = self.estimate_homography(keypoints_ref, keypoints_img, good_matches)
-        
-        if homography is None:
-            print("Failed to estimate homography")
-            return None
-        
-        # Validate the homography
-        is_valid, confidence = self.validate_stitching(reference_panorama, image, homography)
-        if not is_valid:
-            print(f"Homography validation failed (confidence: {confidence:.2f})")
-            return None
-        else:
-            print(f"Homography validation passed (confidence: {confidence:.2f})")
-        
-        # Step 4: Calculate bounds and warp
-        if self.visualize:
-            print("Step 4: Warping image...")
-        
-        output_width, output_height, offset_x, offset_y = self.calculate_stitching_bounds(
-            reference_panorama, image, homography)
-        
-        print(f"Panorama bounds: {output_width}x{output_height}, offset: ({offset_x}, {offset_y})")
-        
-        warped = self.warp_image(image, homography, (output_width, output_height), offset_x, offset_y)
-        
-        # Step 5: Create panorama
-        if self.visualize:
-            print("Step 5: Creating panorama...")
-        
-        panorama = self.create_panorama(reference_panorama, warped, offset_x, offset_y)
-        
-        # Step 6: Post-process
-        if self.visualize:
-            print("Step 6: Post-processing...")
-        
+        # Step 7: Post-process final panorama
+        print("Step 7: Post-processing final panorama...")
         final_panorama = self.post_process(panorama)
         
-        # Visualize final result if enabled
-        if self.visualize:
-            self.step_counter += 1
-            
-            # Save visualization
-            cv2.imwrite(f"{self.test_output_dir}/step_{self.step_counter:02d}_final_panorama.jpg", final_panorama)
-            
-            cv2.imshow("Final Panorama", final_panorama)
-            cv2.waitKey(1000)  # Wait 1 second for final result
-            cv2.destroyAllWindows()
-        
         return final_panorama
-    
-    def stitch_multiple_adaptive(self, images, reference_index=None):
-        """
-        Adaptive stitching that tries reference-based approach first, falls back to sequential
+
+    def post_process(self, panorama):
+        """Apply minimal post-processing - only crop black borders"""
+        if panorama is None:
+            return None
         
-        Args:
-            images: list of numpy arrays
-            reference_index: index of reference image (defaults to middle image)
-            
-        Returns:
-            numpy array: panorama image
-        """
-        if len(images) < 2:
-            raise ValueError("Need at least 2 images for stitching")
+        # Only crop black borders - no color transformations or filters
+        cropped = self.crop_black_borders(panorama)
         
-        print("Attempting reference-based stitching...")
-        try:
-            result = self.stitch_with_reference(images, reference_index)
-            if result is not None:
-                print("Reference-based stitching successful!")
-                return result
-        except Exception as e:
-            print(f"Reference-based stitching failed: {e}")
-        
-        print("Falling back to sequential stitching...")
-        return self.stitch_multiple(images)
-    
+        return cropped
+
     def crop_black_borders(self, panorama):
-        """
-        Crop black borders from the panorama
-        
-        Args:
-            panorama: input panorama image
-            
-        Returns:
-            numpy array: cropped panorama
-        """
+        """Crop black borders from the panorama"""
         if panorama is None:
             return None
         
@@ -793,7 +658,6 @@ class ManualImageStitcher:
         gray = cv2.cvtColor(panorama, cv2.COLOR_BGR2GRAY)
         
         # Use a higher threshold to be more aggressive about cropping
-        # This helps remove dark borders that might not be pure black
         _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
         
         # Find non-zero pixels (non-black regions)
@@ -820,57 +684,48 @@ class ManualImageStitcher:
             return panorama
         
         return cropped
-    
-    def post_process(self, panorama):
-        """
-        Apply minimal post-processing - only crop black borders
+
+    def validate_stitching(self, image1, image2, homography):
+        """Validate if stitching is likely to succeed"""
+        if homography is None:
+            return False, 0.0
         
-        Args:
-            panorama: input panorama image
+        # Check if homography is reasonable
+        det = np.linalg.det(homography)
+        if det <= 0:
+            return False, 0.0
+        
+        # If images are provided, check if transformation is not too extreme
+        if image1 is not None and image2 is not None:
+            h1, w1 = image1.shape[:2]
+            h2, w2 = image2.shape[:2]
             
-        Returns:
-            numpy array: processed panorama
-        """
-        if panorama is None:
-            return None
+            # Transform corners of image2
+            corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
+            warped_corners2 = cv2.perspectiveTransform(corners2, homography)
+            
+            # Check if transformed corners are reasonable
+            for corner in warped_corners2:
+                x, y = corner.ravel()
+                # Check if corner is within reasonable bounds
+                if x < -w1 or x > 2*w1 or y < -h1 or y > 2*h1:
+                    return False, 0.0
         
-        # Only crop black borders - no color transformations or filters
-        cropped = self.crop_black_borders(panorama)
+        # Calculate confidence based on determinant
+        confidence = min(1.0, det / 10.0)  # Normalize determinant
         
-        return cropped
-    
+        return True, confidence
+
     def visualize_matches(self, image1, image2, keypoints1, keypoints2, matches):
-        """
-        Create visualization of feature matches
-        
-        Args:
-            image1: first image
-            image2: second image
-            keypoints1: keypoints from first image
-            keypoints2: keypoints from second image
-            matches: list of cv2.DMatch objects
-            
-        Returns:
-            numpy array: visualization image
-        """
+        """Create visualization of feature matches"""
         # Draw matches
         img_matches = cv2.drawMatches(image1, keypoints1, image2, keypoints2, 
                                      matches, None, 
                                      flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
         return img_matches
-    
+
     def visualize_keypoints(self, image, keypoints, style="rich"):
-        """
-        Visualize keypoints on an image
-        
-        Args:
-            image: input image
-            keypoints: list of cv2.KeyPoint objects
-            style: visualization style ("simple", "rich", "color")
-            
-        Returns:
-            numpy array: image with keypoints drawn
-        """
+        """Visualize keypoints on an image"""
         if style == "simple":
             return cv2.drawKeypoints(image, keypoints, None)
         elif style == "rich":
@@ -886,165 +741,269 @@ class ManualImageStitcher:
         else:
             return cv2.drawKeypoints(image, keypoints, None, 
                                    flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    
-    def visualize_homography(self, image1, image2, homography, title="Homography"):
+
+    def auto_determine_focal_length(self, images):
         """
-        Visualize homography transformation
+        Automatically determine focal length from images
         
         Args:
-            image1: first image
-            image2: second image
-            homography: homography matrix
-            title: window title
+            images: list of input images
             
         Returns:
-            numpy array: visualization image
+            float: estimated focal length
         """
-        # Get image dimensions
-        h1, w1 = image1.shape[:2]
-        h2, w2 = image2.shape[:2]
+        # Method 1: Try to extract from EXIF
+        focal_lengths = []
+        for i, image in enumerate(images):
+            # For now, we'll use a simple estimation
+            # In practice, you'd extract EXIF data here
+            pass
         
-        # Transform corners of image2
-        corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
-        warped_corners2 = cv2.perspectiveTransform(corners2, homography)
+        # Method 2: Estimate from feature geometry
+        if not focal_lengths:
+            focal_lengths = self.estimate_focal_from_features(images)
         
-        # Create a visualization showing both images and the transformation
-        # Create a larger canvas to show both images
-        canvas_width = w1 + w2
-        canvas_height = max(h1, h2)
-        canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
-        
-        # Place image1 on the left
-        canvas[:h1, :w1] = image1
-        
-        # Place image2 on the right
-        canvas[:h2, w1:w1+w2] = image2
-        
-        # Draw the transformed corners on the canvas
-        for i, corner in enumerate(warped_corners2):
-            x, y = corner.ravel()
-            # Draw corner on the left side (image1 area)
-            cv2.circle(canvas, (int(x), int(y)), 15, (0, 255, 0), 3)
-            # Add corner labels
-            cv2.putText(canvas, str(i+1), (int(x)+20, int(y)+20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Draw original corners of image2 (on the right side)
-        original_corners = [(w1, 0), (w1+w2, 0), (w1+w2, h2), (w1, h2)]
-        for i, (x, y) in enumerate(original_corners):
-            cv2.circle(canvas, (x, y), 10, (255, 0, 0), 2)
-            cv2.putText(canvas, f"{i+1}'", (x+15, y+15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-        
-        # Add connecting lines to show the transformation
-        for i in range(4):
-            x1, y1 = original_corners[i]
-            x2, y2 = warped_corners2[i].ravel()
-            cv2.line(canvas, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
-        
-        return canvas
-    
-    def validate_stitching(self, image1, image2, homography):
-        """
-        Validate if stitching is likely to succeed
-        
-        Args:
-            image1: first image
-            image2: second image
-            homography: homography matrix
+        # Method 3: Use default based on image analysis
+        if not focal_lengths:
+            # Analyze image overlap patterns
+            overlap_ratio = self.analyze_overlap_ratio(images)
             
-        Returns:
-            tuple: (is_valid, confidence_score)
-        """
-        if homography is None:
-            return False, 0.0
+            # Estimate focal length based on overlap
+            # More overlap = shorter focal length
+            if overlap_ratio > 0.5:
+                focal_lengths = [35.0]  # Wide angle
+            elif overlap_ratio > 0.3:
+                focal_lengths = [50.0]  # Normal
+            else:
+                focal_lengths = [25.0]  # Telephoto
         
-        # Check if homography is reasonable
-        # 1. Check determinant (should be positive for valid transformation)
-        det = np.linalg.det(homography)
-        if det <= 0:
-            return False, 0.0
+        return np.median(focal_lengths) if focal_lengths else 25.0
+
+    def estimate_focal_from_features(self, images):
+        """Estimate focal length from feature point analysis"""
+        focal_lengths = []
         
-        # 2. Check if transformation is not too extreme
-        h1, w1 = image1.shape[:2]
-        h2, w2 = image2.shape[:2]
+        # For spherical projection, we'll estimate focal length differently
+        # since we don't want to detect features before projection
+        if self.projection_type == 'spherical':
+            # Use a simpler estimation based on image analysis
+            # This avoids detecting features before projection
+            return [self.focal_length]  # Use configured focal length
         
-        # Transform corners of image2
-        corners2 = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
-        warped_corners2 = cv2.perspectiveTransform(corners2, homography)
-        
-        # Check if transformed corners are reasonable
-        for corner in warped_corners2:
-            x, y = corner.ravel()
-            # Check if corner is within reasonable bounds
-            if x < -w1 or x > 2*w1 or y < -h1 or y > 2*h1:
-                return False, 0.0
-        
-        # Calculate confidence based on determinant and corner positions
-        confidence = min(1.0, det / 10.0)  # Normalize determinant
-        
-        return True, confidence
-    
-    def stitch_panorama(self, images, method="adaptive", reference_index=None):
-        """
-        Complete end-to-end stitching pipeline with multiple strategies
-        
-        Args:
-            images: list of numpy arrays
-            method: stitching method ("sequential", "reference", "adaptive")
-            reference_index: index of reference image (for reference method)
+        # For perspective projection, use feature-based estimation
+        for i in range(len(images)-1):
+            # Detect features in consecutive images
+            kp1, des1 = self.detect_features(images[i])
+            kp2, des2 = self.detect_features(images[i+1])
             
-        Returns:
-            numpy array: final panorama
-        """
-        if len(images) < 2:
-            raise ValueError("Need at least 2 images for stitching")
+            if len(kp1) > 10 and len(kp2) > 10:
+                # Match features
+                matches = self.match_features(des1, des2)
+                good_matches = self.filter_matches(matches)
+                
+                if len(good_matches) > 10:
+                    # Analyze feature point distribution
+                    # Estimate focal length from geometry
+                    focal_length = self.estimate_from_feature_geometry(kp1, kp2, good_matches)
+                    if focal_length > 0:
+                        focal_lengths.append(focal_length)
         
-        # Step 1: Stitch multiple images using specified method
-        if method == "sequential":
-            print("Using sequential stitching method...")
-            panorama = self.stitch_multiple(images)
-        elif method == "reference":
-            print("Using reference-based stitching method...")
-            panorama = self.stitch_with_reference(images, reference_index)
-        elif method == "adaptive":
-            print("Using adaptive stitching method...")
-            panorama = self.stitch_multiple_adaptive(images, reference_index)
+        return focal_lengths
+
+    def estimate_from_feature_geometry(self, kp1, kp2, matches):
+        """Estimate focal length from feature point geometry"""
+        if len(matches) < 10:
+            return 0
+        
+        # Extract matched points
+        src_pts = np.float32([kp2[m.trainIdx].pt for m in matches])
+        dst_pts = np.float32([kp1[m.queryIdx].pt for m in matches])
+        
+        # Calculate point distances
+        distances = np.linalg.norm(src_pts - dst_pts, axis=1)
+        
+        # Estimate focal length from distance distribution
+        # This is a simplified approach - real implementations are more complex
+        mean_distance = np.mean(distances)
+        
+        # Rough estimation based on point spread
+        if mean_distance < 50:
+            return 35.0  # Wide angle
+        elif mean_distance < 100:
+            return 50.0  # Normal
         else:
-            raise ValueError(f"Unknown stitching method: {method}")
+            return 25.0  # Telephoto
+
+    def analyze_overlap_ratio(self, images):
+        """Analyze overlap ratio between consecutive images"""
+        overlap_ratios = []
         
-        if panorama is None:
-            return None
+        # For spherical projection, use a simpler estimation
+        # since we don't want to detect features before projection
+        if self.projection_type == 'spherical':
+            # Estimate overlap based on image content analysis
+            # This is a simplified approach for spherical projection
+            return 0.4  # Assume medium overlap for spherical projection
         
-        # Step 2: Post-process the result
-        processed_panorama = self.post_process(panorama)
+        # For perspective projection, use feature-based analysis
+        for i in range(len(images)-1):
+            # Detect features and estimate overlap
+            kp1, des1 = self.detect_features(images[i])
+            kp2, des2 = self.detect_features(images[i+1])
+            
+            if len(kp1) > 10 and len(kp2) > 10:
+                matches = self.match_features(des1, des2)
+                good_matches = self.filter_matches(matches)
+                
+                # Calculate overlap ratio
+                overlap_ratio = len(good_matches) / min(len(kp1), len(kp2))
+                overlap_ratios.append(overlap_ratio)
         
-        return processed_panorama
-    
-    def stitch_panorama_reference(self, images, reference_index=None):
+        return np.mean(overlap_ratios) if overlap_ratios else 0.3
+
+    def auto_determine_sphere_dimensions(self, images, focal_length):
         """
-        Reference-based stitching pipeline (convenience method)
+        Automatically determine optimal sphere dimensions based on camera parameters
         
         Args:
-            images: list of numpy arrays
-            reference_index: index of reference image (defaults to middle image)
+            images: list of input images
+            focal_length: estimated focal length
             
         Returns:
-            numpy array: final panorama
+            tuple: (width, height) for sphere projection
         """
-        return self.stitch_panorama(images, method="reference", reference_index=reference_index)
-    
-    def stitch_panorama_sequential(self, images):
+        # Use the first image to calculate base dimensions
+        base_image = images[0]
+        sphere_width, sphere_height = self.calculate_sphere_dimensions(base_image)
+        
+        # Analyze overlap to adjust for panorama width
+        overlap_ratio = self.analyze_overlap_ratio(images)
+        
+        # Adjust width based on overlap (more overlap = narrower panorama needed)
+        if overlap_ratio > 0.5:
+            # High overlap - narrow panorama
+            sphere_width = int(sphere_width * 1.5)
+        elif overlap_ratio > 0.3:
+            # Medium overlap - standard panorama
+            sphere_width = int(sphere_width * 2.0)
+        else:
+            # Low overlap - wide panorama
+            sphere_width = int(sphere_width * 3.0)
+        
+        return sphere_width, sphere_height
+
+    def auto_configure_projection(self, images):
         """
-        Sequential stitching pipeline (convenience method)
+        Automatically configure projection parameters
         
         Args:
-            images: list of numpy arrays
+            images: list of input images
             
         Returns:
-            numpy array: final panorama
+            dict: configuration parameters
         """
-        return self.stitch_panorama(images, method="sequential")
+        print("Auto-configuring projection parameters...")
+        
+        # Step 1: Determine focal length
+        focal_length = self.auto_determine_focal_length(images)
+        print(f"Estimated focal length: {focal_length:.1f}mm")
+        
+        # Step 2: Calculate sphere dimensions based on camera parameters
+        sphere_width, sphere_height = self.auto_determine_sphere_dimensions(images, focal_length)
+        print(f"Calculated sphere dimensions: {sphere_width}x{sphere_height}")
+        
+        # Step 3: Update configuration
+        self.focal_length = focal_length
+        
+        return {
+            'focal_length': focal_length,
+            'sphere_width': sphere_width,
+            'sphere_height': sphere_height
+        }
+
+    def create_correspondence_lookup(self, all_keypoints, all_descriptors, images):
+        """
+        Create a lookup table of correspondences between all image pairs
+        
+        Args:
+            all_keypoints: list of keypoints for all images
+            all_descriptors: list of descriptors for all images
+            images: list of input images (for validation)
+            
+        Returns:
+            dict: lookup table with (img1, img2) -> (match_count, homography)
+        """
+        print("Creating correspondence lookup table...")
+        lookup = {}
+        
+        # Calculate correspondences between all image pairs
+        for i in range(len(all_keypoints)):
+            for j in range(i + 1, len(all_keypoints)):
+                print(f"Calculating correspondences between images {i} and {j}...")
+                
+                # Match features between image pair
+                matches = self.match_features(all_descriptors[i], all_descriptors[j])
+                good_matches = self.filter_matches(matches)
+                
+                if len(good_matches) >= self.min_matches:
+                    # Estimate homography
+                    homography, mask = self.estimate_homography(all_keypoints[i], all_keypoints[j], good_matches)
+                    
+                    if homography is not None:
+                        # Validate homography
+                        is_valid, confidence = self.validate_stitching(images[i], images[j], homography)
+                        if is_valid:
+                            lookup[(i, j)] = (len(good_matches), homography)
+                            lookup[(j, i)] = (len(good_matches), np.linalg.inv(homography))  # Inverse for reverse direction
+                            print(f"  Images {i}-{j}: {len(good_matches)} matches")
+                        else:
+                            print(f"  Images {i}-{j}: homography validation failed")
+                    else:
+                        print(f"  Images {i}-{j}: homography estimation failed")
+                else:
+                    print(f"  Images {i}-{j}: insufficient matches ({len(good_matches)} < {self.min_matches})")
+        
+        return lookup
+
+    def find_best_next_image(self, used_images, lookup):
+        """
+        Find the best next image to stitch based on correspondence lookup
+        
+        Args:
+            used_images: set of already used image indices
+            lookup: correspondence lookup table
+            
+        Returns:
+            tuple: (best_image_idx, best_match_count, best_homography)
+        """
+        best_image_idx = -1
+        best_match_count = 0
+        best_homography = None
+        
+        # Find the remaining image with most correspondences to any used image
+        for remaining_img in range(len(self.all_keypoints)):
+            if remaining_img in used_images:
+                continue
+            
+            # Check correspondences with all used images
+            total_matches = 0
+            best_homography_for_img = None
+            
+            for used_img in used_images:
+                key = (used_img, remaining_img)
+                if key in lookup:
+                    match_count, homography = lookup[key]
+                    total_matches += match_count
+                    if best_homography_for_img is None or match_count > best_match_count:
+                        best_homography_for_img = homography
+            
+            # Update best if this image has more total correspondences
+            if total_matches > best_match_count:
+                best_match_count = total_matches
+                best_image_idx = remaining_img
+                best_homography = best_homography_for_img
+        
+        return best_image_idx, best_match_count, best_homography
 
 def main():
     """Main function to demonstrate usage"""
@@ -1052,17 +1011,20 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Manual Image Stitcher')
-    parser.add_argument('--dataset', type=str, default='boat',
+    parser.add_argument('--dataset', type=str,
                        help='Dataset name (default: boat)')
-    parser.add_argument('--output_name', type=str, default='manual_panorama.jpg',
+    parser.add_argument('--output_name', type=str, default='panorama.jpg',
                        help='Name of output panorama file')
-    parser.add_argument('--method', type=str, default='adaptive',
-                       choices=['sequential', 'reference', 'adaptive'],
-                       help='Stitching method to use')
     parser.add_argument('--reference_index', type=int, default=None,
-                       help='Index of reference image (for reference method)')
+                       help='Index of reference image (defaults to middle image)')
     parser.add_argument('--no-visualize', action='store_true',
                        help='Disable step-by-step visualization (enabled by default)')
+    parser.add_argument('--projection', type=str,
+                       choices=['perspective', 'spherical'],
+                       help='Projection type: perspective or spherical (default: perspective)')
+    parser.add_argument('--focal_length', type=float, default=25.0,
+                       help='Focal length for spherical projection in mm (default: 25.0)')
+    # Remove sphere_width and sphere_height arguments - they're calculated automatically
     
     args = parser.parse_args()
     
@@ -1074,9 +1036,12 @@ def main():
     output_dir = get_output_dir(args.dataset, "output")
     steps_dir = get_output_dir(args.dataset, "steps")
     
-    # Initialize stitcher
+    # Initialize stitcher with projection settings
     config = StitchingConfig()
-    stitcher = ManualImageStitcher(config, visualize=visualize, test_output_dir=steps_dir)
+    config.projection_type = args.projection
+    config.focal_length = args.focal_length
+    
+    stitcher = ImageStitcher(config, visualize=visualize, test_output_dir=steps_dir)
     
     # Load images
     image_files = glob.glob(os.path.join(input_dir, "*.jpg"))
@@ -1098,22 +1063,25 @@ def main():
         print("Need at least 2 images for stitching")
         return
     
-    # Stitch panorama
-    panorama = stitcher.stitch_panorama(images, method=args.method, reference_index=args.reference_index)
+    # Stitch panorama using intelligent reference-based approach
+    panorama = stitcher.stitch_intelligent_reference(images, args.reference_index)
     
     if panorama is not None:
-        # Save result
+        # Save result with projection type in filename
         os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, args.output_name)
+        base_name = os.path.splitext(args.output_name)[0]
+        ext = os.path.splitext(args.output_name)[1]
+        output_filename = f"{base_name}_{args.projection}{ext}"
+        output_path = os.path.join(output_dir, output_filename)
         cv2.imwrite(output_path, panorama)
-        print(f"Manual panorama saved as {output_path}")
+        print(f"Panorama saved as {output_path} using {args.projection} projection")
         
         # Display result
-        cv2.imshow("Manual Panorama", panorama)
+        cv2.imshow(f"Panorama - {args.projection}", panorama)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     else:
-        print("Manual stitching failed")
+        print("Stitching failed")
 
 if __name__ == "__main__":
     main() 
