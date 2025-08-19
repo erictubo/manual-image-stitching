@@ -1,4 +1,4 @@
-# From-Scratch Image Stitching
+# Manual Image Stitching for Panoramas
 
 This repository contains a *manual* implementation of image stitching in Python with the aim to reproduce similar results to OpenCV's built-in *automatic* `cv2.Stitcher`.
 
